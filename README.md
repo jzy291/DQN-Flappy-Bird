@@ -1,1 +1,1 @@
-运行 python mian.py 开始训练
+终端运行 python mian.py 开始训练
