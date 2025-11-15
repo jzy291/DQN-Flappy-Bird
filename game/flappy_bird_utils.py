@@ -1,6 +1,7 @@
 import pygame
 import sys
 
+
 def load():
     # 玩家三种翅膀姿态的图片路径
     PLAYER_PATH = (
