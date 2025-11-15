@@ -1,46 +1,68 @@
-import os, sys, cv2, random, numpy as np, collections, datetime
-import torch, torch.nn as nn
-from torch.autograd import Variable
-import matplotlib.pyplot as plt
+import pdb
+import cv2
+import sys
+import os
 
 sys.path.append("game/")
 import wrapped_flappy_bird as game
+import random
+import numpy as np
+from collections import deque
+import torch
+from torch.autograd import Variable
+import torch.nn as nn
 
-# 超参数
-GAME = 'bird'
-ACTIONS = 2
-GAMMA = 0.99
-OBSERVE = 1000  # 观察期步数
-EXPLORE = 2000000  # epsilon 退火总步数
-INITIAL_EPSILON = 0.1  # 原始代码 0.0001 基本不探索，改回 0.1
-FINAL_EPSILON = 0.0001
-REPLAY_MEMORY = 50000
-BATCH_SIZE = 32
-FRAME_PER_ACTION = 1
-UPDATE_TIME = 100  # 目标网络同步步数
-width = height = 80
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print('running on:', device)
+# 超参数区
+GAME = 'bird'  # 日志文件名标识
+ACTIONS = 2  # 动作空间维度（跳或不跳）
+GAMMA = 0.99  # 贝尔曼方程折扣因子
+OBSERVE = 1000.  # 训练前先观察（纯累积经验）的步数
+EXPLORE = 2000000.  # epsilon 从初始值降到最终值所需的步数
+FINAL_EPSILON = 0.0001  # 最小探索率
+INITIAL_EPSILON = 0.0001  # 初始探索率（源码已设得很小，几乎不随机）
+REPLAY_MEMORY = 50000  # 经验池最大容量
+BATCH_SIZE = 32  # 每次训练采样的批大小
+FRAME_PER_ACTION = 1  # 每多少帧才允许决策一次（这里=1表示每帧都决策）
+UPDATE_TIME = 100  # 每隔多少步把主网络权重同步给目标网络
+SAVE_MODEL_TIME = 1000  # 每隔多少步保存权重文件
+width = 80  # 预处理后的画面宽
+height = 80  # 预处理后的画面高
 
 
+# 图像预处理
 def preprocess(observation):
-    obs = cv2.cvtColor(cv2.resize(observation, (80, 80)), cv2.COLOR_BGR2GRAY)
-    _, obs = cv2.threshold(obs, 1, 255, cv2.THRESH_BINARY)
-    return obs[np.newaxis, :, :]  # shape (1,80,80)
+    # 先缩放到 80×80，再转灰度图
+    observation = cv2.cvtColor(cv2.resize(observation, (80, 80)), cv2.COLOR_BGR2GRAY)
+    # 二值化：像素>1 的置 255，其余 0，去掉背景细节
+    ret, observation = cv2.threshold(observation, 1, 255, cv2.THRESH_BINARY)
+    # 返回形状 (1,80,80) 的 float32 数组，供后续使用
+    return np.reshape(observation, (1, 80, 80))
 
 
+# 网络结构
 class DeepNetWork(nn.Module):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, ):
+        super(DeepNetWork, self).__init__()
+        # 输入 4 帧 80×80，输出 2 个动作 Q 值
         self.conv1 = nn.Sequential(
-            nn.Conv2d(4, 32, 8, 4, 2), nn.ReLU(inplace=True), nn.MaxPool2d(2))
+            nn.Conv2d(in_channels=4, out_channels=32, kernel_size=8, stride=4, padding=2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2)
+        )
         self.conv2 = nn.Sequential(
-            nn.Conv2d(32, 64, 4, 2, 1), nn.ReLU(inplace=True))
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True)
+        )
         self.conv3 = nn.Sequential(
-            nn.Conv2d(64, 64, 3, 1, 1), nn.ReLU(inplace=True))
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        # 全连接：1600→256→2
         self.fc1 = nn.Sequential(
-            nn.Linear(1600, 256), nn.ReLU())
-        self.out = nn.Linear(256, ACTIONS)
+            nn.Linear(1600, 256),
+            nn.ReLU()
+        )
+        self.out = nn.Linear(256, 2)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -51,249 +73,162 @@ class DeepNetWork(nn.Module):
         return self.out(x)
 
 
-class BrainDQNMain:
+class BrainDQNMain(object):
+    def save(self):
+        """把主网络权重落盘到 params.pth"""
+        print("save model param")
+        torch.save(self.Q_net.state_dict(), 'params.pth')
+
+    def load(self):
+        """若存在存档则把权重同时载入主网络与目标网络"""
+        if os.path.exists("params.pth"):
+            print("load model param")
+            self.Q_net.load_state_dict(torch.load('params.pth'))
+            self.Q_netT.load_state_dict(torch.load('params.pth'))
+
     def __init__(self, actions):
-        self.replayMemory = collections.deque(maxlen=REPLAY_MEMORY)
+        self.replayMemory = deque()  # init some parameters
         self.timeStep = 0
         self.epsilon = INITIAL_EPSILON
         self.actions = actions
+        self.Q_net = DeepNetWork()  # 主网络
+        self.Q_netT = DeepNetWork()  # 目标网络（固定一段时间再更新）
+        self.load()  # 尝试载入存档
+        self.loss_func = nn.MSELoss()  # 回归损失
+        LR = 1e-6
+        self.optimizer = torch.optim.Adam(self.Q_net.parameters(), lr=LR)
 
-        self.Q_net = DeepNetWork().to(device)
-        self.Q_netT = DeepNetWork().to(device)
-        self.loss_fn = nn.MSELoss()
-        self.optimizer = torch.optim.Adam(self.Q_net.parameters(), lr=1e-6)
-
-        # ---- 统计量 ----
-        self.episode_count = 0
-        self.episode_reward = 0
-        self.episode_loss = 0
-        self.episode_q = 0
-        self.train_steps = 0
-
-        self.ep_rewards = []  # 每个episode的总奖励
-        self.ep_losses = []  # 每个episode的平均损失
-        self.ep_qs = []  # 每个episode的平均Q值
-
-        self.loss_history = []  # 每次训练的损失
-        self.reward_history = []  # 每步的奖励
-
-        self.load()
-
-    def save(self):
-        torch.save({'model': self.Q_net.state_dict(),
-                    'opt': self.optimizer.state_dict()},
-                   'checkpoint.pth')
-        print('checkpoint saved.')
-
-    def load(self):
-        if os.path.exists('checkpoint.pth'):
-            ckpt = torch.load('checkpoint.pth', map_location=device)
-            self.Q_net.load_state_dict(ckpt['model'])
-            self.Q_netT.load_state_dict(ckpt['model'])
-            self.optimizer.load_state_dict(ckpt['opt'])
-            print('checkpoint loaded.')
-
-    def plot_metrics(self):
-        os.makedirs('logs', exist_ok=True)
-        stamp = datetime.datetime.now().strftime('%m%d_%H%M%S')
-
-        plt.figure(figsize=(15, 5))
-
-        # 绘制episode级别的指标
-        plt.subplot(131)
-        if self.ep_losses:
-            plt.plot(self.ep_losses)
-            plt.title('Episode Loss')
-            plt.xlabel('Episode')
-            plt.ylabel('Average Loss')
-
-        plt.subplot(132)
-        if self.ep_rewards:
-            plt.plot(self.ep_rewards)
-            plt.title('Episode Reward')
-            plt.xlabel('Episode')
-            plt.ylabel('Total Reward')
-
-        plt.subplot(133)
-        if self.ep_qs:
-            plt.plot(self.ep_qs)
-            plt.title('Episode Q-value')
-            plt.xlabel('Episode')
-            plt.ylabel('Average |Q|')
-
-        plt.tight_layout()
-        plt.savefig(f'logs/metrics_{stamp}.png')
-        plt.close()
-
-        # 绘制训练过程的详细指标
-        plt.figure(figsize=(15, 5))
-
-        plt.subplot(131)
-        if self.loss_history:
-            # 对损失进行平滑处理
-            if len(self.loss_history) > 100:
-                smooth_loss = np.convolve(self.loss_history, np.ones(100) / 100, mode='valid')
-                plt.plot(smooth_loss)
-                plt.title('Training Loss (Smoothed)')
-            else:
-                plt.plot(self.loss_history)
-                plt.title('Training Loss')
-            plt.xlabel('Training Step')
-            plt.ylabel('Loss')
-
-        plt.subplot(132)
-        if self.reward_history:
-            # 对奖励进行平滑处理
-            if len(self.reward_history) > 100:
-                smooth_reward = np.convolve(self.reward_history, np.ones(100) / 100, mode='valid')
-                plt.plot(smooth_reward)
-                plt.title('Step Reward (Smoothed)')
-            else:
-                plt.plot(self.reward_history)
-                plt.title('Step Reward')
-            plt.xlabel('Step')
-            plt.ylabel('Reward')
-
-        plt.subplot(133)
-        if self.ep_rewards:
-            # 显示最近100个episode的奖励
-            recent_rewards = self.ep_rewards[-100:] if len(self.ep_rewards) > 100 else self.ep_rewards
-            plt.plot(recent_rewards)
-            plt.title('Recent Episode Rewards')
-            plt.xlabel('Episode (relative)')
-            plt.ylabel('Total Reward')
-
-        plt.tight_layout()
-        plt.savefig(f'logs/training_{stamp}.png')
-        plt.close()
-
-        print(f'saved logs/metrics_{stamp}.png and logs/training_{stamp}.png')
-
+    # 训练
     def train(self):
-        if len(self.replayMemory) < BATCH_SIZE:
-            return 0
+        # 从回放池中随机采样 BATCH_SIZE 条转移
+        minibatch = random.sample(self.replayMemory, BATCH_SIZE)
+        state_batch = [data[0] for data in minibatch]  # 当前状态
+        action_batch = [data[1] for data in minibatch]  # 动作（one-hot）
+        reward_batch = [data[2] for data in minibatch]  # 立即奖励
+        nextState_batch = [data[3] for data in minibatch]  # 下一状态
 
-        batch = random.sample(self.replayMemory, BATCH_SIZE)
-        state_batch = torch.cat([torch.Tensor(b[0]).unsqueeze(0) for b in batch]).to(device)
-        action_batch = torch.LongTensor([b[1] for b in batch]).to(device)
-        reward_batch = torch.Tensor([b[2] for b in batch]).to(device)
-        next_batch = torch.cat([torch.Tensor(b[3]).unsqueeze(0) for b in batch]).to(device)
-        terminal_batch = torch.BoolTensor([b[4] for b in batch]).to(device)
+        # 计算目标 y（贝尔曼目标）
+        y_batch = np.zeros([BATCH_SIZE, 1])
+        nextState_batch = np.array(nextState_batch)
+        nextState_batch = torch.Tensor(nextState_batch)
+        action_batch = np.array(action_batch)
+        index = action_batch.argmax(axis=1)  # 取出实际执行动作的索引
+        print("action " + str(index))
+        index = np.reshape(index, [BATCH_SIZE, 1])
+        action_batch_tensor = torch.LongTensor(index)  # 转 LongTensor 供 gather 使用
 
-        q_next = self.Q_netT(next_batch).max(1)[0].detach()
-        y = reward_batch + (~terminal_batch) * GAMMA * q_next
-        q_pred = self.Q_net(state_batch).gather(1, action_batch.unsqueeze(1)).squeeze(1)
+        # 用目标网络计算下一状态所有动作的 Q 值
+        QValue_batch = self.Q_netT(nextState_batch)
+        QValue_batch = QValue_batch.detach().numpy()
 
-        loss = self.loss_fn(q_pred, y)
+        # 根据是否终止，计算 y = r + gamma * max Q(s', a')
+        for i in range(0, BATCH_SIZE):
+            terminal = minibatch[i][4]
+            if terminal:
+                y_batch[i][0] = reward_batch[i]
+            else:
+                y_batch[i][0] = reward_batch[i] + GAMMA * np.max(QValue_batch[i])
+
+        y_batch = np.array(y_batch)
+        y_batch = np.reshape(y_batch, [BATCH_SIZE, 1])
+
+        # 主网络预测 Q(s, a) 并提取实际动作对应的 Q 值
+        state_batch_tensor = Variable(torch.Tensor(state_batch))
+        y_batch_tensor = Variable(torch.Tensor(y_batch))
+        y_predict = self.Q_net(state_batch_tensor).gather(1, action_batch_tensor)
+
+        # 计算 MSE 损失并反向传播
+        loss = self.loss_func(y_predict, y_batch_tensor)
+        print("loss is " + str(loss))
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        # 记录损失
-        loss_value = loss.item()
-        self.episode_loss += loss_value
-        self.train_steps += 1
-        self.loss_history.append(loss_value)
-
+        # 每 UPDATE_TIME 步把主网络权重同步给目标网络
         if self.timeStep % UPDATE_TIME == 0:
             self.Q_netT.load_state_dict(self.Q_net.state_dict())
 
-        # 保存网络
-        if self.timeStep % 1000 == 0:
+        # 每 SAVE_MODEL_TIME 保存权重文件
+        if self.timeStep % SAVE_MODEL_TIME == 0:
             self.save()
 
-        return loss_value
+
+
+    def setPerception(self, nextObservation, action, reward, terminal):
+        """
+        环境每步调用此接口：
+        1. 把旧状态、动作、奖励、新状态、终止信号打包存入经验池
+        2. 经验池满后丢弃最早样本
+        3. 观察期结束后开始训练
+        4. 打印当前阶段（observe / explore / train）与 epsilon
+        """
+        # 用最新一帧替换掉 4 帧中的最旧一帧
+        newState = np.append(self.currentState[1:, :, :], nextObservation, axis=0)
+        self.replayMemory.append((self.currentState, action, reward, newState, terminal))
+        if len(self.replayMemory) > REPLAY_MEMORY:
+            self.replayMemory.popleft()
+        if self.timeStep > OBSERVE:  # Train the network
+            self.train()
+
+        # print info
+        state = ""
+        if self.timeStep <= OBSERVE:
+            state = "observe"
+        elif self.timeStep > OBSERVE and self.timeStep <= OBSERVE + EXPLORE:
+            state = "explore"
+        else:
+            state = "train"
+        print("TIMESTEP", self.timeStep, "/ STATE", state, "/ EPSILON", self.epsilon)
+        self.currentState = newState
+        self.timeStep += 1
 
     def getAction(self):
-        state = torch.Tensor(self.currentState).unsqueeze(0).to(device)
-        with torch.no_grad():
-            qval = self.Q_net(state)[0]
-        self.episode_q += qval.abs().mean().item()
-
+        """
+        epsilon-greedy 策略：
+        若随机数 < epsilon 则随机选动作，否则选 Q 值最大的动作。
+        随时间步线性降低 epsilon。
+        """
+        currentState = torch.Tensor([self.currentState])
+        QValue = self.Q_net(currentState)[0]
         action = np.zeros(self.actions)
         if self.timeStep % FRAME_PER_ACTION == 0:
             if random.random() <= self.epsilon:
-                act_idx = random.randrange(self.actions)
+                action_index = random.randrange(self.actions)
+                print("choose random action " + str(action_index))
+                action[action_index] = 1
             else:
-                act_idx = qval.argmax().item()
-            action[act_idx] = 1
+                action_index = np.argmax(QValue.detach().numpy())
+                print("choose qnet value action " + str(action_index))
+                action[action_index] = 1
         else:
             action[0] = 1  # do nothing
 
+        # change episilon
         if self.epsilon > FINAL_EPSILON and self.timeStep > OBSERVE:
             self.epsilon -= (INITIAL_EPSILON - FINAL_EPSILON) / EXPLORE
         return action
 
-    def setPerception(self, nextObs, action, reward, terminal):
-        self.episode_reward += reward
-        self.reward_history.append(reward)
+    def setInitState(self, observation):
+        """
+        把第一帧复制 4 份，堆成初始 4 帧状态。
+        observation 形状需为 (1,80,80)
+        """
+        self.currentState = np.stack((observation, observation, observation, observation), axis=0)
+        print(self.currentState.shape)
 
-        newState = np.append(self.currentState[1:], nextObs, axis=0)
-        self.replayMemory.append((self.currentState, action.argmax(),
-                                  reward, newState, terminal))
-        self.currentState = newState
-        self.timeStep += 1
 
-        if self.timeStep > OBSERVE:
-            self.train()
-
-        # ---- episode 结束，记录统计量 ----
-        if terminal:
-            self.episode_count += 1
-
-            # 计算episode的平均值
-            avg_loss = self.episode_loss / max(1, self.train_steps)
-            avg_q = self.episode_q / self.timeStep  # 使用当前episode的总步数
-
-            self.ep_losses.append(avg_loss)
-            self.ep_rewards.append(self.episode_reward)
-            self.ep_qs.append(avg_q)
-
-            # 每10个episode打印一次统计信息
-            if self.episode_count % 10 == 0:
-                print(f'\nEpisode {self.episode_count}: Reward={self.episode_reward:.1f}, '
-                      f'Avg Loss={avg_loss:.4f}, Avg Q={avg_q:.4f}, '
-                      f'Epsilon={self.epsilon:.5f}')
-
-            # 每100个episode保存一次图表
-            if self.episode_count % 100 == 0:
-                self.plot_metrics()
-
-            # 重置episode统计量
-            self.episode_reward = 0
-            self.episode_loss = 0
-            self.episode_q = 0
-            self.train_steps = 0
-
-        # ---- 打印进度 ----
-        state = ''
-        if self.timeStep <= OBSERVE:
-            state = 'observe'
-        elif self.timeStep <= OBSERVE + EXPLORE:
-            state = 'explore'
-        else:
-            state = 'train'
-
-        print(f'\rTimestep: {self.timeStep} | State: {state:8} | '
-              f'Epsilon: {self.epsilon:.5f} | Episode: {self.episode_count} | '
-              f'Current Reward: {reward:+.1f}', end='')
-
-    def setInitState(self, obs):
-        self.currentState = np.tile(obs, (4, 1, 1))  # (4,80,80)
-
-# 主循环
 if __name__ == '__main__':
-    brain = BrainDQNMain(ACTIONS)
-    game_state = game.GameState()
-
-    # 初始动作：什么都不做
-    do_nothing = np.array([1, 0])
-    obs0, _, _ = game_state.frame_step(do_nothing)
-    obs0 = preprocess(obs0)
-    brain.setInitState(obs0)
-
-    while True:
-        act = brain.getAction()
-        obs, reward, terminal = game_state.frame_step(act)
-        obs = preprocess(obs)
-        brain.setPerception(obs, act, reward, terminal)
+    actions = 2
+    brain = BrainDQNMain(actions)
+    flappyBird = game.GameState()
+    action0 = np.array([1, 0])
+    observation0, reward0, terminal = flappyBird.frame_step(action0)
+    observation0 = cv2.cvtColor(cv2.resize(observation0, (80, 80)), cv2.COLOR_BGR2GRAY)
+    ret, observation0 = cv2.threshold(observation0, 1, 255, cv2.THRESH_BINARY)
+    brain.setInitState(observation0)
+    print(brain.currentState.shape)
+    while 1 != 0:
+        action = brain.getAction()
+        nextObservation, reward, terminal = flappyBird.frame_step(action)
+        nextObservation = preprocess(nextObservation)
+        brain.setPerception(nextObservation, action, reward, terminal)
