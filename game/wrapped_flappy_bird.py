@@ -91,7 +91,7 @@ class GameState:
                 self.playerFlapped = True
                 # SOUNDS['wing'].play()   # 先静音，方便训练
 
-        # ---------------- 得分检测 -----------------
+        # 得分检测
         playerMidPos = self.playerx + PLAYER_WIDTH / 2
         for pipe in self.upperPipes:
             pipeMidPos = pipe['x'] + PIPE_WIDTH / 2
