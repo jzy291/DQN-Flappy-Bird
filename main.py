@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 sys.path.append("game/")
 import wrapped_flappy_bird as game
 
-# ========= 超参 =========
+# 超参数
 GAME = 'bird'
 ACTIONS = 2
 GAMMA = 0.99
